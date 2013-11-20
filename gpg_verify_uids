@@ -1,0 +1,396 @@
+#! /usr/bin/env bash
+#######################################################################
+#         GPG Keysigning Party E-mail Address Verification            #
+#######################################################################
+# Usage: $0 KEYID
+#---------------------------------------------------------------------
+# Creates a subdirectory under $WORKING_DIR for the signing of this
+# key. Pulls the key from a key- server, writes a copy to
+# $KEYID_fromkeyserver.asc writes a cleaned copy to $KEYID_cleaned.asc
+# (used later in the actual signing part).  Generates a unique random
+# nonce string for each UID in the key, formats an email message with
+# the nonce and some other personalization substituted in. Then calls
+# gpg to sign and encrypt the message. Will mail the messages if called
+# with -s or --send-mail
+#---------------------------------------------------------------------
+# @(#) $Id: gen_keysigning_messages,v 1.7 2013/11/20 02:39:56 rjenson Exp $
+#---------------------------------------------------------------------
+# Author: Rob Jenson <rbj_gpg@spotch.com>
+#
+# This script is in the public domain. If you find it useful or make
+# improvements to it, shoot me an email. Inspired by, and some fixes
+# provided by Christoph Martin.
+#######################################################################
+
+#######################################################################
+# CONFIGURATION 
+#######################################################################
+# Top level directory. Work on each key goes in a sub-directory
+#  under here, named by the full keyid. Will be created if it
+#  doesn't exist. If you use an alternate keyring for keysigning, this
+#  would be a good place for it.
+WORKING_DIR="${HOME}/gpg_keys/lisa2013_keysigning"
+
+# How long (in bytes of random data) do you want your nonce to be?
+# The openssl command must be in your path
+RANDBYTES=10
+
+# Set this value to 1 if you want the script to send out the emails directly, or
+# call with the "-s" or "--send-mail" command-line switch.
+# The files will be saved in the working directory in all cases. In an abundance
+# of caution, the script 
+export DO_MAIL=0
+
+# Set value of DEBUG > 0 to output debugging messages. The higher the level
+#  the more verbose this script will be. I think the highest level we used
+#  is 3. Set this value to the initial debugging level. Value on the command line
+#  will then change this.
+export DEBUG=0
+
+# If you are having problems with GPG you can bump up the verbosity here
+export VERBOSITY=""
+# Uncomment if you want GPG to be more verbose:
+#VERBOSITY="-v"
+#VERBOSITY="-v -v"
+
+GPGDEBUG="--debug-level none"
+# Uncomment if you want debugging output. Level can be basic, advanced, expert or guru
+#GPGDEBUG="--debug-level basic"
+
+# Set ALTKEYRINGS to 1 if you want to use a keyring other than your default keyring.
+# If you do use an alternate keyring, it is up to you to copy it to the working
+# directory, or point to the location. If you set this to 1, you must point to
+# the secret keyring and trustdb too.
+ALTKEYRINGS=0
+
+if [ $ALTKEYRINGS -gt 0 ]
+then
+# Important assumption here -- you have created these keyrings #
+# and they contain your public and secret keys in them!!!      #
+    PUBRING="${WORKING_DIR}/pubring.gpg"
+    SECRING="${WORKING_DIR}/secring.gpg"
+    TRUSTDB="${WORKING_DIR}/trustdb.gpg"
+fi    
+
+###############################################################################
+# The mail message template. Edit this as you see fit. Names surrounded by %% #
+# will get substituted later. If you want to have an external template file   #
+# you can twiddle this function to cat it.                                    #
+###############################################################################
+
+mail_template () {
+
+cat - <<EOF
+Dear %%FIRSTNAME%%,
+
+    Thank you for participating in the LISA2013 Keysigning Party.
+
+    This is message %%COUNTER%% of up to %%TOTALMSGS%% that I will be
+    sending to you. This is part of my process for signing PGP/GPG
+    keys. I have verified your identity in person, but I would like to
+    verify that the email addresses in the key UID packets belong to
+    the person who controls the key that I'm signing (presumably, that
+    is you).
+
+    I am sending one message to each email address in a PGP/GPG UID
+    string of your PGP/GPG key 0x%%KEYID%%. Each email message is
+    encrypted with your public key, and it contains a "nonce" string,
+    of 20 random-generated hexadecimal digits.
+
+    Your nonce is: %%NONCE%%     %%EMAIL%%
+
+    Please send a reply to me at either of my email addresses,
+    encrypted with my public key (available from any keyserver,
+    details below). Your reply should include the nonce from above.
+
+    If your key has multiple UIDs, you will receive multiple messages
+    like this, each with a different nonce. You may return all the
+    nonces in one encrypted email message. Your knowledge of the nonce
+    is sufficient to connect the key to your email address.
+
+    If I am signing multiple keys for you, I might only send you one
+    nonce per distinct email address.
+
+    Let me know if you have any questions about this.
+
+
+Best regards,
+
+_rob_
+
+--
+pub   4096R/86EF0FF0 2013-10-23 [expires: 2017-10-23]
+      Key fingerprint = 9152 5B82 35DD 718F 3D52  CD4C 1D3A A60C 86EF
+      0FF0
+uid                  Rob Jenson <rbj_gpg@spotch.com>
+uid                  Rob Jenson <rjenson@chs.harvard.edu>
+sub   4096R/7A402D25 2013-10-23 [expires: 2017-10-23]
+
+EOF
+}
+
+GPGOPTS="${VERBOSITY} ${GPGDEBUG} --armor"
+
+if [ $ALTKEYRINGS -gt 0 ]
+then
+    GPGOPTS="${GPGOPTS} --no-default-keyring --keyring ${PUBRING} \
+	--secret-keyring ${SECRING} \
+	--trustdb ${TRUSTDB}"
+fi
+
+# Set these if the commands are not in your path or you would prefer
+# to set the path for them
+GPGCMD=
+OPENSSLCMD=
+MAILCMD=
+
+#############################################
+###### NO MORE CONFIGURATION BELOW HERE #####
+#############################################
+
+####################################
+# Clean up if something goes wrong #
+####################################
+
+cleanup () {
+    cd ${STARTDIR}
+}
+
+################################################
+# Exit with error messages and a return value  #
+################################################
+
+errorexit () {
+    retval=$1
+    shift
+    while [ $# -gt 0 ]
+    do
+	echo $1
+	shift
+    done	
+
+    cleanup
+    
+    exit $retval
+}
+    
+##########################################################################
+# Output debugging messages to stderr if the value of $DEBUG is greater  #
+# than or equal to the level of the message (parameter 1).               #
+##########################################################################
+
+debugmsg () {
+    debuglevel=$1
+
+    if [ $debuglevel ]; then shift; else return 0; fi
+
+    if [ $DEBUG -ge ${debuglevel} ]
+    then
+	while [ $# -gt 0 ]
+	do
+	    echo "$1" >&2
+	    shift
+	done
+    fi
+}
+
+##########################################################
+# Print out help message for using the program and exit. #
+##########################################################
+
+helpmsg () {
+    echo "${PROGNAME} [-h|--help] [-v|--verbose] [-d|--debug <debuglvl>] [-s|--send-email] <keyid>"
+    echo ""
+    echo "Generates messages to each UID on the key with a random nonce"
+    echo "-h or --help displays this help message"
+    echo "-d or --debug followed by an integer sets debug level"
+    echo "-s or --send-email sends the emails. Emails will be saved to ${WORKING_DIR}/${keyid}"
+    echo "keyid must be a 16-hex digit PGP key ID"
+}
+
+##########################################################
+# Parse the arguments on the command line                #
+##########################################################
+
+parse_commandline () {
+
+    while [ $# -gt 1 ]
+    do
+	debugmsg 3 "parse_commandline: Top of loop $# -> $1"
+	
+	case $1 in
+	    -d | --debug )
+		export DEBUG=$2
+		shift
+		;;
+
+	    -h | --help )
+		helpmsg
+		exit 0
+		;;
+
+	    -s | --send-mail )
+		export DO_MAIL=1
+		;;
+
+	    -v | --verbose )
+		export VERBOSITY="${VERBOSITY} --verbose"
+		;;
+		
+	esac
+
+	shift
+    done
+
+    lastparam=$1
+
+    if [[ ${lastparam} =~ ^(-h|--help)$ ]]
+    then
+	helpmsg
+	exit 0
+    fi
+
+    if [[ ${lastparam} =~ [0-9A-F]{16} ]]
+    then
+	export KEYID="${lastparam}"
+    else
+	if [[ ${lastparam} =~ ^Ox[0-9a-fA-F]{16}$ ]]
+	then
+	  KEYID=${lastparam:2}
+	else
+	    helpmsg
+	    exit 1
+	fi
+    fi	
+}
+
+##########################################################################
+# MAIN PROGRAM BEGINS HERE
+##########################################################################
+
+trap 'cleanup; exit 17'  2 3 5 10 13 15
+
+OPENSSLCMD=${OPENSSLCMD:-`which openssl`}
+if [ X$OPENSSLCMD = X ]; then errorexit 1 "No OPENSSL command found"; fi
+GPGCMD=${GPGCMD:-`which gpg2`}
+if [ X$GPGCMD = X ]; then errorexit 1 "No GPG command found"; fi
+
+MAILCMD=${MAILCMD:-`which mailx`}
+if [ $DO_MAIL -gt 0 ]
+then
+    if [ X$MAILCMD = X ]; then errorexit 1 "No MAIL command found"; fi
+else
+    MAILCMD="echo"
+fi
+
+export PROGNAME=`basename $0`
+
+parse_commandline $*
+
+# FIXME!: Verify that a valid key ID is on command line. Assuming a
+#         16 hex digit key ID throughout.
+
+STARTDIR=`pwd`
+
+WORKDIR="${WORKING_DIR}/${KEYID}"
+debugmsg 3 "Creating ${WORKDIR}"
+error=`mkdir -m 700 -p -v ${WORKDIR} 2>&1`
+if [ $? -ne 0 ]
+then
+    if echo error | egrep -v "File exists"
+    then
+	errorexit 1 "Could not create ${WORKDIR}"
+    fi
+fi    
+cd ${WORKDIR}
+
+# See if we can fetch the key
+debugmsg 3 "Fetching GPG Key $KEYID"
+$GPGCMD $GPGOPTS --recv-key $KEYID
+if [ $? -ne 0 ]
+then
+    errorexit 2 "No key for $KEYID available from keyserver"
+fi    
+
+$GPGCMD $GPGOPTS --export $KEYID > ${KEYID}_fromkeyserver.asc
+
+$GPGCMD $GPGOPTS --export-options export-clean --export $KEYID > ${KEYID}_cleaned.asc
+
+UIDFILE="${KEYID}_uids"
+$GPGCMD $GPGOPTS --list-key --with-colons $KEYID | awk -F: '/^uid/ {print($10)}' > ${UIDFILE}
+
+TOTALMSGS=`wc -l ${UIDFILE} | awk '{print($1)}'`
+debugmsg 2 "${TOTALMSGS} user ids found."
+
+if [ $TOTALMSGS -le 0 ]; then errorexit 2 "No UIDs found in key $KEYID"; fi
+
+# You can use the MANIFEST file to verify the nonce when you get your responses
+MANIFEST="${KEYID}_manifest"
+COUNTER=1
+> $MANIFEST
+# Generate a manifest file to be merged later into the tracking database
+# We will also parse it later to generate the messages
+cat ${UIDFILE} | while read LINE
+do
+    # Assume that their first name is the first token in the UID. This is probably wrong in some
+    # countries and weird UID formats
+    FIRSTNAME=`echo $LINE | awk -F\  '{print($1)}'`
+
+    # Also assume that the email address is enclosed in < > brackets
+    EMAIL=`echo $LINE | sed 's/^.*<\(.*@.*\)>.*$/\1/'`
+    if [ X$EMAIL = X ]
+    then
+	debugmsg 0 "Unable to extract email address from: $LINE ... skipping"
+	TOTALMSGS=`expr $TOTALMSGS - 1`
+	continue
+    fi
+
+    debugmsg 1 "Extracted email address ${EMAIL} from UID"
+
+    NONCE=`${OPENSSLCMD} rand -hex ${RANDBYTES}`
+    echo "${KEYID}|${COUNTER}|${LINE}|${NONCE}|${EMAIL}|${FIRSTNAME}" >> $MANIFEST
+
+    FILENAME=`echo "nonce_to_send_to_${EMAIL}.${COUNTER}.txt" | sed 's/@/_at_/'`
+
+    debugmsg 1 "Unencrypted message file: ${FILENAME}"
+
+    mail_template | sed \
+	-e 's/%%FIRSTNAME%%/'$FIRSTNAME'/' \
+	-e 's/%%COUNTER%%/'$COUNTER'/' \
+	-e 's/%%TOTALMSGS%%/'$TOTALMSGS'/' \
+	-e 's/%%KEYID%%/'$KEYID'/' \
+	-e 's/%%NONCE%%/'$NONCE'/' \
+	-e 's/%%EMAIL%%/'$EMAIL'/' > ${FILENAME}
+
+    $GPGCMD $GPGOPTS --encrypt --sign --recipient ${KEYID} ${FILENAME}
+
+    if [ -f ${FILENAME}.asc ]
+    then
+	if [ $DO_MAIL -gt 0 ]
+	then
+	    ${MAILCMD} -s "GPG Keysigning Mail Verification Message ${COUNTER}" \
+		${EMAIL} < ${FILENAME}.asc
+	fi
+    else
+    	echo "Error: Did not find file ${FILENAME}.asc ... not attempting to mail it"
+    fi
+
+    COUNTER=`expr 1 + $COUNTER`
+done    
+
+cleanup
+
+######################################################################
+# REVISION HISTORY
+######################################################################
+# v. 1.6: Added some command-line options to make the script a little
+#         more user-friendly.
+# v. 1.5: Added fixes suggested by Christoph Martin to avoid collision
+#         of messages when multiple UIDs had the same email address.
+#         Added the option to send the mail message out automagically.
+#---------------------------------------------------------------------
+# v. 1.4: First Revision released.
+#---------------------------------------------------------------------
+# $Id: gen_keysigning_messages,v 1.7 2013/11/20 02:39:56 rjenson Exp $
+#---------------------------------------------------------------------
+######################################################################
